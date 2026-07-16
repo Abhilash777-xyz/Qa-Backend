@@ -123,6 +123,20 @@ def create_app() -> FastAPI:
     # ── Routes ────────────────────────────────────────────────────────────────
     app.include_router(api_router)
 
+    # ── Static Files ──────────────────────────────────────────────────────────
+    import os
+    from fastapi.staticfiles import StaticFiles
+    from fastapi.responses import FileResponse
+
+    # Ensure static directory exists
+    os.makedirs("static", exist_ok=True)
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+    @app.get("/")
+    def read_index():
+        """Serve the visual dashboard UI."""
+        return FileResponse("static/index.html")
+
     # ── Health check ──────────────────────────────────────────────────────────
     @app.get("/health", tags=["Health"], summary="Health check")
     def health() -> dict[str, Any]:

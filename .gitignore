@@ -36,3 +36,7 @@ htmlcov/
 
 # Alembic (generated versions are committed, not the cache)
 __pycache__/
+
+# SQLite WAL files
+*.db-shm
+*.db-wal
