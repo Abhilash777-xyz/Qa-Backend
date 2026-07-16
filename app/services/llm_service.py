@@ -23,6 +23,7 @@ what was used for earlier generations.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -294,29 +295,33 @@ def _natural_sort_key(numbering: str) -> list[int]:
 def _call_llm_with_retry(content: str) -> list[TestCase]:
     """
     Call the OpenRouter API and parse the response.
-    Retries once on malformed output.
+    Retries on malformed output (parse errors) up to llm_max_retries.
+    Rate-limit (429) retries are handled inside _call_openrouter.
 
     Raises:
         LLMResponseParseError after all retries are exhausted.
-        LLMError on HTTP/network failure.
+        LLMError on unrecoverable HTTP/network failure.
     """
     prompt = _USER_PROMPT_V1.format(content=content[:12000])  # Safety truncation.
 
     last_error: Exception | None = None
-    for attempt in range(1 + settings.llm_max_retries):
-        logger.info("LLM call attempt %d/%d", attempt + 1, 1 + settings.llm_max_retries)
+    max_attempts = 1 + settings.llm_max_retries
+    for attempt in range(max_attempts):
+        logger.info("LLM call attempt %d/%d", attempt + 1, max_attempts)
         try:
             raw_response = _call_openrouter(prompt)
             test_cases = _parse_llm_response(raw_response)
             return test_cases
         except LLMError:
-            raise  # Don't retry HTTP errors.
+            raise  # Don't retry on HTTP errors (already retried 429 inside _call_openrouter).
         except Exception as exc:
             last_error = exc
             logger.warning("LLM response parse failed (attempt %d): %s", attempt + 1, exc)
+            if attempt < max_attempts - 1:
+                time.sleep(2)  # Small pause before parse retry.
 
     raise LLMResponseParseError(
-        f"LLM returned unparseable output after {1 + settings.llm_max_retries} attempts.",
+        f"LLM returned unparseable output after {max_attempts} attempts.",
         detail=str(last_error),
     )
 
@@ -348,17 +353,39 @@ def _call_openrouter(user_prompt: str) -> str:
         "max_tokens": 4096,
     }
 
-    try:
-        with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
-            response = client.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
+    # Retry up to 3 times on 429 (rate limit) with exponential backoff.
+    _rate_limit_delays = [5, 15, 30]
+    last_http_exc: Exception | None = None
+    for _rl_attempt, _delay in enumerate([(0, *_rate_limit_delays)], 0):
+        if _rl_attempt > 0:
+            wait = _rate_limit_delays[_rl_attempt - 1]
+            logger.warning("OpenRouter rate limited (429). Retrying in %ds...", wait)
+            time.sleep(wait)
+        try:
+            with httpx.Client(timeout=settings.llm_timeout_seconds) as client:
+                response = client.post(url, json=payload, headers=headers)
+                if response.status_code == 429 and _rl_attempt < len(_rate_limit_delays):
+                    last_http_exc = httpx.HTTPStatusError(
+                        "429", request=response.request, response=response
+                    )
+                    continue  # Retry after backoff.
+                response.raise_for_status()
+                break  # Success.
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429 and _rl_attempt < len(_rate_limit_delays):
+                last_http_exc = exc
+                continue
+            raise LLMError(
+                f"OpenRouter returned HTTP {exc.response.status_code}.",
+                detail=exc.response.text[:500],
+            ) from exc
+        except httpx.RequestError as exc:
+            raise LLMError(f"Network error calling OpenRouter: {exc}") from exc
+    else:
         raise LLMError(
-            f"OpenRouter returned HTTP {exc.response.status_code}.",
-            detail=exc.response.text[:500],
-        ) from exc
-    except httpx.RequestError as exc:
-        raise LLMError(f"Network error calling OpenRouter: {exc}") from exc
+            "OpenRouter rate limit (429) persisted after retries.",
+            detail=str(last_http_exc),
+        )
 
     data = response.json()
     try:
